@@ -1,0 +1,153 @@
+import tensorflow as tf
+import numpy as np
+
+
+
+# Define the loss function
+def pinn_loss(model, x, y, z, w):
+    with tf.GradientTape(persistent=True) as tape:
+        tape.watch(x)
+        tape.watch(y)
+        tape.watch(z)
+        tape.watch(w)
+        # Predict the pressure using the neural network
+        pred_p = model(x, y, z, w)
+        # Compute the gradients of the pressure
+        dp_dx = tape.gradient(pred_p, x)
+        dp_dy = tape.gradient(pred_p, y)
+        dp_dz = tape.gradient(pred_p, z)
+        # Compute the second derivatives of the pressure
+        d2p_dx2 = tape.gradient(dp_dx, x)
+        d2p_dy2 = tape.gradient(dp_dy, y)
+        d2p_dz2 = tape.gradient(dp_dz, z)
+        # Compute the residual of the Webster equation
+        residual = ((s0 + s1*z + s2*z**2) * d2p_dz2 
+                    + (2*s2*z + s1) * dp_dz 
+                    + (k**2 * s0 + k**2 * s1*z + k**2 * s2*z**2) * pred_p)
+    return tf.reduce_mean(tf.square(residual))
+
+# Define the neural network architecture
+class PINN(tf.keras.Model):
+    def __init__(self, layers, activation=tf.nn.tanh):
+        super().__init__()
+        self.activation = activation
+        self.dense_layers = []
+        for units in layers[:-1]:
+            self.dense_layers.append(tf.keras.layers.Dense(units, activation=self.activation))
+        self.output_layer = tf.keras.layers.Dense(layers[-1])
+
+    def call(self, x, y, z, w):
+        # Concatenate the input variables
+        inputs = tf.concat([x, y, z, w], axis=1)
+        # Pass the inputs through the dense layers
+        for layer in self.dense_layers:
+            inputs = layer(inputs)
+        # Pass the inputs through the output layer
+        output = self.output_layer(inputs)
+        return output
+
+# Define the training procedure
+def train(model, optimizer, x, y, z, w, epochs=10000, batch_size=128):
+    for epoch in range(epochs):
+        # Create a batch of random samples
+        indices = np.random.choice(x.shape[0], size=batch_size, replace=False)
+        x_batch = x[indices]
+        y_batch = y[indices]
+        z_batch = z[indices]
+        w_batch = w[indices]
+        # Compute the loss and gradients
+        with tf.GradientTape() as tape:
+            loss = pinn_loss(model, x_batch, y_batch, z_batch, w_batch)
+        gradients = tape.gradient(loss, model.trainable_variables)
+        # Update the weights using the optimizer
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+        # Print the loss every 100 epochs
+        if epoch % 100 == 0:
+            print("Epoch {} Loss {:.4f}".format(epoch, loss.numpy()))
+
+# Define the input variables and parameters
+L = [1.0, 1.0]  # Lengths of the segments
+s0 = 1.0  # Coefficient of the constant term
+s1 = 0.1  # Coefficient of the linear term
+s2 = 0.01  # Coefficient of the quadratic term
+k = 2*np.pi*1000  # Angular frequency of the acoustic wave
+n_points = 1000  # Number of grid points along the duct
+x = np.linspace(0, sum(L), n_points)[:, None]  # Axial coordinate
+y = np.zeros_like(x)  # Lateral coordinate (assume straight duct)
+z = np.zeros_like(x)  # Local axial coordinate
+for i, l in enumerate(L):
+    z[i*n_points//(len(L)): (i+1)*n_points//(len(L))] = np.linspace(0, l, n_points//(len(L)))[:, None]
+w = np.full_like(x, k)  # Angular frequency of the acoustic wave
+x = tf.convert_to_tensor(x.reshape(n_points, 1), dtype=tf.float32)
+y = tf.convert_to_tensor(y.reshape(n_points, 1), dtype=tf.float32)
+z = tf.convert_to_tensor(z.reshape(n_points, 1), dtype=tf.float32)
+w = tf.convert_to_tensor(w.reshape(n_points, 1), dtype=tf.float32)
+
+def get_loss_and_gradients(model, x, y, z, w):
+    with tf.GradientTape(persistent=True) as tape:
+        # Forward pass of the model
+        p = model(x, y, z)
+
+        # Compute the residual of the PDE
+        residual = p * (1.0 - p) * (x + y + z + w + 2.0) - 0.5 * (z - w)
+
+        # Compute the mean squared error loss
+        loss = tf.reduce_mean(tf.square(residual))
+
+    # Compute the gradients of the loss with respect to the trainable variables
+    gradients = tape.gradient(loss, model.trainable_variables)
+
+    return loss, gradients
+
+def train(model, optimizer, x, y, z, w, epochs=1000, batch_size=100):
+    for epoch in range(epochs):
+        # Create a batch of random samples
+        indices = np.random.choice(x.shape[0], size=batch_size, replace=False)
+        if isinstance(x, tf.Tensor):
+            x_batch = x.numpy()[indices]
+            y_batch = y.numpy()[indices]
+            z_batch = z.numpy()[indices]
+            w_batch = w.numpy()[indices]
+        else:
+            x_batch = x[indices]
+            y_batch = y[indices]
+            z_batch = z[indices]
+            w_batch = w[indices]
+
+        # Compute the loss and gradients
+        loss, grads = get_loss_and_gradients(model, x_batch, y_batch, z_batch, w_batch)
+
+        # Apply the gradients to update the weights
+        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+
+        if epoch % 100 == 0:
+            print(f"Epoch {epoch}, loss {loss:.4f}")
+
+# Create the PINN model
+model = PINN([64, 64, 64, 1])
+
+# Create the optimizer
+optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+
+# Train the PINN model
+train(model, optimizer, x, y, z, w)
+
+# Evaluate the PINN model
+p_pred = model(x, y, z, k)
+
+# Plot the results
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 4))
+plt.subplot(1, 2, 1)
+plt.plot(x, p_pred.numpy(), label='PINN')
+plt.xlabel('Axial coordinate (m)')
+plt.ylabel('Acoustic pressure (Pa)')
+plt.legend()
+plt.subplot(1, 2, 2)
+plt.plot(z, p_pred.numpy(), label='PINN')
+plt.xlabel('Local axial coordinate (m)')
+plt.ylabel('Acoustic pressure (Pa)')
+plt.legend()
+plt.tight_layout()
+plt.show()
